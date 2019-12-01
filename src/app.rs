@@ -15,21 +15,22 @@ use rustypill::lcd;
 use serde::{Deserialize, Serialize};
 use core::fmt::Write;
 use heapless::consts::*;
-use heapless::String;
+use heapless::{String, Vec};
 use heapless::spsc::{Consumer, Producer, Queue};
 
-use cortex_m::asm;
+use cortex_m::{asm, singleton};
 use stm32f1xx_hal::serial::{Serial, Config, Tx, Rx};
 use stm32f1xx_hal::stm32::USART1;
 use stm32f1xx_hal::prelude::*;
 use embedded_hal::digital::v2::OutputPin;
-//use cortex_m_semihosting::{debug, hprintln};
+use heapless::ArrayLength;
+use cortex_m_semihosting::{debug, hprintln};
 
-pub struct SerialRx<'a, T: heapless::ArrayLength<u8>> {
+pub struct SerialRx<'a, T: ArrayLength<u8>> {
     rx_cons: Consumer<'a, u8, T>
 }
 
-impl<'a, T: heapless::ArrayLength<u8>> SerialRx<'a, T> {
+impl<'a, T: ArrayLength<u8>> SerialRx<'a, T> {
     pub fn new(rx_cons: Consumer<'a, u8, T>) -> Self {
         SerialRx{ rx_cons }
     }
@@ -62,6 +63,18 @@ impl<'a, T: heapless::ArrayLength<u8>> SerialRx<'a, T> {
             while !self.rx_cons.ready() {}
             *b = self.rx_cons.dequeue().unwrap();
         }
+    }
+
+    pub fn read_until(&mut self, marker: u8, buf: &mut [u8]) -> u16 {
+        let mut i = 0;
+        for b in buf.iter_mut() {
+            while !self.rx_cons.ready() {}
+            let byte = self.rx_cons.dequeue().unwrap();
+            if byte == marker { break }
+            i += 1;
+            *b = byte;
+        }
+        i
     }
 
     pub fn clear(&mut self) {
@@ -100,20 +113,31 @@ pub enum ESPConnStatus {
     Connected
 }
 
-pub struct ESPWifi<'a, T: heapless::ArrayLength<u8>> {
+pub struct ESPWifi<'a, T: ArrayLength<u8>> {
     esp_in: SerialTx,
     esp_out: SerialRx<'a, T>,
+    mac: [u8; 17],
     ssid: String<U16>,
     password: String<U32>,
 }
 
-impl<'a,  T: heapless::ArrayLength<u8>> ESPWifi<'a, T> {
+fn gen_json_rest<T: ArrayLength<u8>>(ep: &str, host: &str, json: &str, rest: &mut String<T>) {
+    rest.write_fmt(format_args!(
+        "PUT {} HTTP/1.1\n\
+         Host: {}\n\
+         Content-type: json/application\n\
+         Content-length: {}\n\n\
+         {}", ep, host, json.len(), json)).unwrap()
+}
+
+impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
     pub fn new(esp_in: SerialTx,
                esp_out: SerialRx<'a, T>,
                ssid: &str, password: &str) -> Self {
         ESPWifi {
             esp_in,
             esp_out,
+            mac: [0; 17],
             ssid: String::from(ssid),
             password: String::from(password)
         }
@@ -123,7 +147,9 @@ impl<'a,  T: heapless::ArrayLength<u8>> ESPWifi<'a, T> {
         self.esp_in.write("ATE0\r\n");
         self.esp_out.jump_to_marker("OK", "ERROR")?;
         self.esp_in.write("AT+CIPRECVMODE=1\r\n");
-        self.esp_out.jump_to_marker("OK", "ERROR")
+        self.esp_out.jump_to_marker("OK", "ERROR")?;
+        self._get_mac();
+        Ok(())
     }
 
     pub fn connect_ap(&mut self) -> Result<(), ()> {
@@ -156,6 +182,36 @@ impl<'a,  T: heapless::ArrayLength<u8>> ESPWifi<'a, T> {
         Ok(())
     }
 
+    pub fn recv(&mut self, data: &mut [u8]) -> Result<u16, ()> {
+        let mut cmd = String::<U32>::new();
+        let mut len: [u8; 8] = [0; 8];
+        let mut nread = 0;
+        self.esp_out.clear();
+        for d in data.chunks_mut(1024) {
+            cmd.clear();
+            cmd.write_fmt(format_args!("AT+CIPRECVDATA={}\r\n", d.len())).unwrap();
+            self.esp_in.write(cmd.as_str());
+            match self.esp_out.jump_to_marker("+CIPRECVDATA,", "OK") {
+                Ok(_) => {
+                    // read length int
+                    let t = self.esp_out.read_until(':' as u8, &mut len);
+                    let clen: u16 = core::str::from_utf8(&len[..t as usize]).unwrap().parse().unwrap();
+                    // read the chunk of data
+                    self.esp_out.read(&mut d[..clen as usize]);
+                    nread += clen;
+                    if (clen as usize) < d.len() {
+                        break
+                    }
+                    self.esp_out.jump_to_marker("OK", "ERROR")?;
+                },
+                Err(_) => {
+                    break
+                }
+            }
+        }
+        Ok(nread)
+    }
+
     pub fn disconnect(&mut self) -> Result<(), ()> {
         self.esp_in.write("AT+CIPCLOSE\r\n");
         self.esp_out.jump_to_marker("OK", "ERROR")
@@ -176,16 +232,32 @@ impl<'a,  T: heapless::ArrayLength<u8>> ESPWifi<'a, T> {
             _ => core::unreachable!()
         }
     }
+
+    fn _get_mac(&mut self) {
+        self.esp_in.write("AT+CIPSTAMAC_CUR?\r\n");
+        self.esp_out.jump_to_marker("+CIPSTAMAC_CUR:\"", "ERROR").unwrap();
+        self.esp_out.read(&mut self.mac);
+        self.esp_out.jump_to_marker("OK", "ERROR").unwrap();
+    }
+
+    fn get_mac(&self) -> &str {
+        core::str::from_utf8(&self.mac).unwrap()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct TestMsg<'a> {
     cmd: &'a str,
+    mac: &'a str,
     temp: u32,
-    timestamp: u32
+    timestamp: u32,
 }
 
-fn check_conn<'a, T: heapless::ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) {
+struct ServerResp<'a> {
+    status: &'a str
+}
+
+fn check_conn<'a, T: ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) {
     match wifi.status() {
         ESPConnStatus::NoWifi => {
             while let Err(_) = wifi.connect_ap() {
@@ -211,16 +283,31 @@ fn check_conn<'a, T: heapless::ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: 
     //lcd.puts("connected.\n")
 }
 
-fn test_send_loop<'a, T: heapless::ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) -> Result<(), ()> {
+fn test_send_loop<'a, T: ArrayLength<u8>>(id: &str, wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) -> Result<(), ()> {
     let msg = TestMsg {
         cmd: "hi",
+        mac: wifi.get_mac(),
         temp: 24,
         timestamp: 0xffff
     };
-    let json: String<U64> = serde_json_core::to_string(&msg).unwrap();
-    //wifi.send("hello, world!\n".as_bytes())?;
-    wifi.send(json.as_str().as_bytes())?;
-    lcd.puts("sent.\n");
+    {
+        let mut rest = String::<U2048>::new();
+        {
+            let json: String<U2048> = serde_json_core::to_string(&msg).unwrap();
+            let mut ep = String::<U32>::new();
+            ep.write_fmt(format_args!("/{}", id)).unwrap();
+            gen_json_rest(ep.as_str(), "192.168.1.120", json.as_str(), &mut rest)
+                //wifi.send("hello, world!\n".as_bytes())?;
+        }
+        wifi.send(rest.as_str().as_bytes())?;
+    }
+    {
+        let mut got = Vec::<_, U2048>::new();
+        got.resize(2048, 0).unwrap();
+        cortex_m::asm::delay(4000000);
+        let nread = wifi.recv(&mut got).unwrap();
+        lcd.puts(core::str::from_utf8(&got[..nread as usize]).unwrap());
+    }
     Ok(())
 }
 
@@ -293,9 +380,13 @@ const APP: () = {
         let wifi = &mut cx.resources.wifi;
         let lcd = &cx.resources.lcd;
         wifi.init().unwrap();
+        let mut id = String::<U12>::new();
+        for ch in wifi.get_mac().chars() {
+            if ch != ':' { id.push(ch).unwrap() }
+        }
         check_conn(wifi, lcd);
         loop {
-            if let Err(_) = test_send_loop(wifi, lcd) {
+            if let Err(_) = test_send_loop(id.as_str(), wifi, lcd) {
                 check_conn(wifi, lcd)
             }
             cortex_m::asm::delay(8000000);

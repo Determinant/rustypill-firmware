@@ -1,5 +1,3 @@
-#![no_std]
-
 extern crate stm32f1;
 use stm32f1::stm32f103::{Interrupt, Peripherals, CorePeripherals, GPIOA, GPIOB, RCC, AFIO, gpioa, rcc, afio};
 
