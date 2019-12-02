@@ -118,7 +118,7 @@ fn gen_json_rest<T: ArrayLength<u8>>(ep: &str, host: &str, json: &str, rest: &mu
     rest.write_fmt(format_args!(
         "PUT {} HTTP/1.1\r\n\
          Host: {}\r\n\
-         Content-type: json/application\r\n\
+         Content-type: application/json\r\n\
          Content-length: {}\r\n\r\n\
          {}", ep, host, json.len(), json)).unwrap()
 }
@@ -341,9 +341,9 @@ fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Des
             let nread = wifi.recv(&mut chunk).unwrap();
             if nread > 0 {
                 buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
-                if buff.len() >= end {
-                    break
-                }
+            }
+            if buff.len() >= end {
+                break
             }
         }
         let resp_json = core::str::from_utf8(&buff[header_off..end]).unwrap();
@@ -435,7 +435,7 @@ const APP: () = {
         };
         loop {
             let mut buff = Vec::<u8, U2048>::new();
-            match rest_put(wifi, lcd, &mut buff, ep.as_str(), "192.168.1.120", &msg) {
+            match rest_put(wifi, lcd, &mut buff, "192.168.1.120", &ep.as_str(), &msg) {
                 Ok(resp) => {
                     let resp: ServerResp = resp;
                     lcd.puts(resp.status);
