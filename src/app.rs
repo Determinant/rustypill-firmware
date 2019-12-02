@@ -11,13 +11,21 @@ use heapless::{String, Vec};
 use heapless::spsc::{Consumer, Producer, Queue};
 
 use panic_halt as _;
-use cortex_m::asm;
+use cortex_m::{asm};
 use stm32f1xx_hal::serial::{Serial, Config, Tx, Rx};
 use stm32f1xx_hal::stm32::USART1;
 use stm32f1xx_hal::prelude::*;
+use stm32f1xx_hal::stm32::Interrupt;
 use embedded_hal::digital::v2::OutputPin;
 use heapless::ArrayLength;
-//use cortex_m_semihosting::{debug, hprintln};
+use stm32f1::stm32f103::{NVIC};
+
+use embedded_websocket as ws;
+use ws::{
+    EmptyRng, WebSocket, WebSocketOptions, WebSocketReceiveMessageType, WebSocketSendMessageType,
+    WebSocketServer, WebSocketState, WebSocketKey
+};
+use cortex_m_semihosting::{debug, hprintln};
 
 pub struct SerialRx<'a, T: ArrayLength<u8>> {
     rx_cons: Consumer<'a, u8, T>
@@ -100,6 +108,47 @@ impl SerialTx {
 
 }
 
+struct MutexGuard<T>(*mut T, bool);
+
+impl<T> Drop for MutexGuard<T> {
+    fn drop(&mut self) {
+        if self.1 {
+            unsafe { NVIC::unmask(Interrupt::USART2); }
+        }
+    }
+}
+
+impl<T> core::ops::Deref for MutexGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe {&*self.0} }
+}
+
+impl<T> core::ops::DerefMut for MutexGuard<T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe {&mut *self.0} }
+}
+
+struct Mutex<T> {
+    data: core::cell::UnsafeCell<T>
+}
+
+impl<T> Mutex<T> {
+    pub fn new(v: T) -> Self {
+        Mutex {
+            data: core::cell::UnsafeCell::new(v)
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<T> {
+        let unmask = if NVIC::is_enabled(Interrupt::USART2) {
+            NVIC::mask(Interrupt::USART2);
+            true
+        } else { false };
+        MutexGuard(self.data.get(), unmask)
+    }
+}
+
+unsafe impl<T> Sync for Mutex<T> {}
+
 #[derive(Copy, Clone)]
 pub enum ESPLinkID {
     Conn0 = 0,
@@ -115,12 +164,16 @@ pub enum ESPConnStatus {
     Connected
 }
 
-pub struct ESPWifi<'a, T: ArrayLength<u8>> {
+struct ESPWifiInner<'a, T: ArrayLength<u8>> {
     esp_in: RefCell<SerialTx>,
     esp_out: RefCell<SerialRx<'a, T>>,
-    mac: [u8; 17],
     ssid: String<U16>,
     password: String<U32>,
+}
+
+pub struct ESPWifi<'a, T: ArrayLength<u8>> {
+    inner: Mutex<ESPWifiInner<'a, T>>,
+    mac: [u8; 17],
 }
 
 fn gen_json_rest<T: ArrayLength<u8>>(ep: &str, host: &str, json: &str, rest: &mut String<T>) {
@@ -132,35 +185,20 @@ fn gen_json_rest<T: ArrayLength<u8>>(ep: &str, host: &str, json: &str, rest: &mu
          {}", ep, host, json.len(), json)).unwrap()
 }
 
-impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
-    pub fn new(esp_in: SerialTx,
-               esp_out: SerialRx<'a, T>,
-               ssid: &str, password: &str) -> Self {
-        ESPWifi {
-            esp_in: RefCell::new(esp_in),
-            esp_out: RefCell::new(esp_out),
-            mac: [0; 17],
-            ssid: String::from(ssid),
-            password: String::from(password)
-        }
-    }
-
-    pub fn init(&mut self) -> Result<(), ()> {
-        {
-            let mut esp_in = self.esp_in.borrow_mut();
-            let mut esp_out = self.esp_out.borrow_mut();
-            esp_in.write("ATE0\r\n");
-            esp_out.jump_to_marker("OK", "ERROR")?;
-            esp_in.write("AT+CIPRECVMODE=1\r\n");
-            esp_out.jump_to_marker("OK", "ERROR")?;
-            esp_in.write("AT+CIPMUX=1\r\n");
-            esp_out.jump_to_marker("OK", "ERROR")?;
-        }
-        self._get_mac();
+impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
+    fn init(&self) -> Result<(), ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
+        esp_in.write("ATE0\r\n");
+        esp_out.jump_to_marker("OK", "ERROR")?;
+        esp_in.write("AT+CIPRECVMODE=1\r\n");
+        esp_out.jump_to_marker("OK", "ERROR")?;
+        esp_in.write("AT+CIPMUX=1\r\n");
+        esp_out.jump_to_marker("OK", "ERROR")?;
         Ok(())
     }
 
-    pub fn connect_ap(&self) -> Result<(), ()> {
+    fn connect_ap(&self) -> Result<(), ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         esp_in.write("AT+CWMODE=1\r\n");
@@ -171,7 +209,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn connect(&self, ip: &str, port: u16, lid: ESPLinkID) -> Result<(), ()> {
+    fn connect(&self, ip: &str, port: u16, lid: ESPLinkID) -> Result<(), ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U64>::new();
@@ -180,7 +218,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn send(&self, data: &[u8], lid: ESPLinkID) -> Result<(), ()> {
+    fn send(&self, data: &[u8], lid: ESPLinkID) -> Result<(), ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
@@ -196,7 +234,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         Ok(())
     }
 
-    pub fn recv(&self, data: &mut [u8], lid: ESPLinkID) -> Result<u16, ()> {
+    fn recv(&self, data: &mut [u8], lid: ESPLinkID) -> Result<u16, ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
@@ -228,7 +266,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         Ok(nread)
     }
 
-    pub fn disconnect(&self, lid: ESPLinkID) -> Result<(), ()> {
+    fn disconnect(&self, lid: ESPLinkID) -> Result<(), ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
@@ -237,7 +275,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn status(&self, lid: ESPLinkID) -> ESPConnStatus {
+    fn status(&self, lid: ESPLinkID) -> ESPConnStatus {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         esp_in.write("AT+CIPSTATUS\r\n");
@@ -262,16 +300,64 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         }
     }
 
-    fn _get_mac(&mut self) {
+    fn get_mac(&self, mac: &mut [u8]) {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         esp_in.write("AT+CIPSTAMAC_CUR?\r\n");
         esp_out.jump_to_marker("+CIPSTAMAC_CUR:\"", "ERROR").unwrap();
-        esp_out.read(&mut self.mac);
+        esp_out.read(mac);
         esp_out.jump_to_marker("OK", "ERROR").unwrap();
     }
+}
 
-    fn get_mac(&self) -> &str {
+
+impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
+    pub fn new(esp_in: SerialTx,
+               esp_out: SerialRx<'a, T>,
+               ssid: &str, password: &str) -> Self {
+        ESPWifi{
+            inner: Mutex::new(ESPWifiInner {
+                esp_in: RefCell::new(esp_in),
+                esp_out: RefCell::new(esp_out),
+                ssid: String::from(ssid),
+                password: String::from(password)
+            }),
+            mac: [0; 17],
+        }
+    }
+
+    pub fn init(&mut self) -> Result<(), ()> {
+        let inner = self.inner.lock();
+        inner.init()?;
+        inner.get_mac(&mut self.mac);
+        Ok(())
+    }
+
+    pub fn connect_ap(&self) -> Result<(), ()> {
+        self.inner.lock().connect_ap()
+    }
+
+    pub fn connect(&self, ip: &str, port: u16, lid: ESPLinkID) -> Result<(), ()> {
+        self.inner.lock().connect(ip, port, lid)
+    }
+
+    pub fn send(&self, data: &[u8], lid: ESPLinkID) -> Result<(), ()> {
+        self.inner.lock().send(data, lid)
+    }
+
+    pub fn recv(&self, data: &mut [u8], lid: ESPLinkID) -> Result<u16, ()> {
+        self.inner.lock().recv(data, lid)
+    }
+
+    pub fn disconnect(&self, lid: ESPLinkID) -> Result<(), ()> {
+        self.inner.lock().disconnect(lid)
+    }
+
+    pub fn status(&self, lid: ESPLinkID) -> ESPConnStatus {
+        self.inner.lock().status(lid)
+    }
+
+    pub fn get_mac(&self) -> &str {
         core::str::from_utf8(&self.mac).unwrap()
     }
 }
@@ -289,23 +375,74 @@ struct ServerResp<'a> {
     status: &'a str
 }
 
-fn check_conn<'a, T: ArrayLength<u8>>(wifi: &ESPWifi<'a, T>, lid: ESPLinkID) {
+fn check_conn<'a, T: ArrayLength<u8>>(wifi: &ESPWifi<'a, T>, lid: ESPLinkID, remote: &(&str, u16)) {
     match wifi.status(lid) {
         ESPConnStatus::NoWifi => {
             while let Err(_) = wifi.connect_ap() {
                 cortex_m::asm::delay(40000000);
             }
-            while let Err(_) = wifi.connect("192.168.1.120", 8080, lid) {
+            while let Err(_) = wifi.connect(remote.0, remote.1, lid) {
                 cortex_m::asm::delay(40000000);
             }
         },
         ESPConnStatus::NoConn => {
-            while let Err(_) = wifi.connect("192.168.1.120", 8080, lid) {
+            while let Err(_) = wifi.connect(remote.0, remote.1, lid) {
                 cortex_m::asm::delay(40000000);
             }
         }
         _ => return
     }
+}
+
+fn recv_resp<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>>(
+        wifi: &ESPWifi<'a, T>, lid: ESPLinkID, buff: &'b mut Vec<u8, U>) -> (usize, usize) {
+    let mut chunk = Vec::<u8, U32>::new();
+    let header_off;
+    let headers;
+    chunk.resize(32, 0).unwrap();
+    loop {
+        let nread = wifi.recv(&mut chunk, lid).unwrap();
+        if nread > 0 {
+            buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
+            let mut _headers = [httparse::EMPTY_HEADER; 16];
+            let mut resp = httparse::Response::new(&mut _headers);
+            if let httparse::Status::Complete(off) = resp.parse(&buff).unwrap() {
+                header_off = off;
+                headers = _headers;
+                break
+            }
+        }
+    }
+    const LENGTH_NAME: &str = "Content-Length";
+    let mut end = header_off;
+    for h in headers.iter() {
+        if h.name.len() != LENGTH_NAME.len() { continue }
+        let mut flag = true;
+        for (a, b) in h.name.as_bytes().iter().zip(LENGTH_NAME.as_bytes()) {
+            let a = *a;
+            let b = *b;
+            let a = if a < 97 { a + 32 } else { a };
+            let b = if b < 97 { b + 32 } else { b };
+            if a != b {
+                flag = false;
+                break
+            }
+        }
+        if flag { 
+            let length: usize = core::str::from_utf8(h.value).unwrap().parse().unwrap();
+            end += length;
+        }
+    }
+    loop {
+        let nread = wifi.recv(&mut chunk, lid).unwrap();
+        if nread > 0 {
+            buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
+        }
+        if buff.len() >= end {
+            break
+        }
+    }
+    (header_off, end)
 }
 
 fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Deserialize<'b>>(
@@ -321,54 +458,51 @@ fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Des
         wifi.send(rest.as_str().as_bytes(), lid)?;
     }
     {
-        let mut chunk = Vec::<u8, U32>::new();
-        let header_off;
-        let headers;
-        chunk.resize(32, 0).unwrap();
-        loop {
-            let nread = wifi.recv(&mut chunk, lid).unwrap();
-            if nread > 0 {
-                buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
-                let mut _headers = [httparse::EMPTY_HEADER; 16];
-                let mut resp = httparse::Response::new(&mut _headers);
-                if let httparse::Status::Complete(off) = resp.parse(&buff).unwrap() {
-                    header_off = off;
-                    headers = _headers;
-                    break
-                }
-            }
-        }
-        const LENGTH_NAME: &str = "Content-Length";
-        let mut end = header_off;
-        for h in headers.iter() {
-            if h.name.len() != LENGTH_NAME.len() { continue }
-            let mut flag = true;
-            for (a, b) in h.name.as_bytes().iter().zip(LENGTH_NAME.as_bytes()) {
-                let a = *a;
-                let b = *b;
-                let a = if a < 97 { a + 32 } else { a };
-                let b = if b < 97 { b + 32 } else { b };
-                if a != b {
-                    flag = false;
-                    break
-                }
-            }
-            if flag { 
-                let length: usize = core::str::from_utf8(h.value).unwrap().parse().unwrap();
-                end += length;
-            }
-        }
-        loop {
-            let nread = wifi.recv(&mut chunk, lid).unwrap();
-            if nread > 0 {
-                buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
-            }
-            if buff.len() >= end {
-                break
-            }
-        }
-        let resp_json = core::str::from_utf8(&buff[header_off..end]).unwrap();
+        let (body_off, body_end) = recv_resp(wifi, lid, buff);
+        let resp_json = core::str::from_utf8(&buff[body_off..body_end]).unwrap();
         Ok(serde_json_core::from_str(resp_json).unwrap())
+    }
+}
+
+struct WSClient<T: rand_core::RngCore> {
+    ws: WebSocket<T>,
+    ws_key: Option<WebSocketKey>
+}
+
+impl<T: rand_core::RngCore> WSClient<T> {
+    fn new(rng: T) -> Self {
+        WSClient {
+            ws: ws::WebSocket::new_client(rng),
+            ws_key: None
+        }
+    }
+
+    fn connect(&mut self, host: &str, endpoint: &str, buff: &mut [u8]) -> Result<usize, ()> {
+        let websocket_options = WebSocketOptions {
+            path: endpoint,
+            host: host,
+            origin: "http://localhost",
+            sub_protocols: None,
+            additional_headers: None,
+        };
+        let (n, k) = self.ws.client_connect(&websocket_options, buff).or(Err(()))?;
+        self.ws_key = Some(k);
+        Ok(n)
+    }
+
+    fn client_accept(&mut self, buff: &[u8]) -> Result<(), ()> {
+        match self.ws_key.as_mut() {
+            Some(k) => self.ws.client_accept(&k, buff).and(Ok(())).or(Err(())),
+            None => Err(())
+        }
+    }
+
+    fn send_text_frame(&mut self, text: &str, buff: &mut [u8]) -> Result<usize, ()> {
+        self.ws.write(ws::WebSocketSendMessageType::Text,
+            true, text.as_bytes(), buff).or(Err(()))
+    }
+    fn recv_text_frame(&mut self, in_buff: &[u8], out_buff: &mut [u8]) -> Result<ws::WebSocketReadResult, ()> {
+        self.ws.read(in_buff, out_buff).or(Err(()))
     }
 }
 
@@ -381,7 +515,7 @@ const APP: () = {
         lcd: lcd::LCD1602
     }
 
-    #[init(spawn = [test_send])]
+    #[init(spawn = [test])]
     fn init(cx: init::Context) -> init::LateResources {
         static mut RX_RB: Option<Queue<u8, U2048>> = None;
         *RX_RB = Some(Queue::new());
@@ -422,49 +556,92 @@ const APP: () = {
         serial.listen(stm32f1xx_hal::serial::Event::Rxne);
         //serial.listen(stm32f1xx_hal::serial::Event::Txe);
         let (tx, rx) = serial.split();
-        cx.spawn.test_send().unwrap();
+        let wifi = ESPWifi::new(
+            SerialTx::new(tx),
+            SerialRx::new(rx_cons),
+            "R1F",
+            "worldhello"
+        );
+        cx.spawn.test().unwrap();
         init::LateResources {
-            wifi: ESPWifi::new(
-                SerialTx::new(tx),
-                SerialRx::new(rx_cons),
-                "R1F",
-                "worldhello"
-            ),
+            wifi,
             rx,
             rx_prod,
             lcd
         }
     }
 
-    #[task(priority = 1, resources = [wifi, lcd])]
+    #[task(priority = 1, resources = [wifi, lcd], spawn = [test_send, test_send2])]
+    fn test(cx: test::Context) {
+        cx.resources.wifi.init().unwrap();
+        cx.spawn.test_send().unwrap();
+        cx.spawn.test_send2().unwrap();
+    }
+
+    #[task(priority = 1, resources = [wifi, lcd], spawn=[test_send])]
     fn test_send(mut cx: test_send::Context) {
         let wifi = &mut cx.resources.wifi;
         let lcd = &cx.resources.lcd;
-        wifi.init().unwrap();
+        let remote = ("192.168.1.120", 8080);
         let mut id = String::<U12>::new();
         for ch in wifi.get_mac().chars() {
             if ch != ':' { id.push(ch).unwrap() }
         }
         let mut ep = String::<U32>::new();
-        ep.write_fmt(format_args!("/{}", id)).unwrap();
-        check_conn(wifi, ESPLinkID::Conn0);
+        let mut buff = Vec::<u8, U2048>::new();
+        ep.write_fmt(format_args!("/{}/update", id)).unwrap();
+        check_conn(wifi, ESPLinkID::Conn0, &remote);
         let msg = TestMsg {
             cmd: "hi",
             mac: wifi.get_mac(),
             temp: 24,
             timestamp: 0xffff
         };
-        loop {
-            let mut buff = Vec::<u8, U2048>::new();
-            match rest_put(wifi, lcd, &mut buff, ESPLinkID::Conn0, "192.168.1.120", &ep.as_str(), &msg) {
-                Ok(resp) => {
-                    let resp: ServerResp = resp;
-                    lcd.puts(resp.status);
-                },
-                Err(_) => check_conn(wifi, ESPLinkID::Conn0)
-            }
-            cortex_m::asm::delay(8000000);
+        cortex_m::asm::delay(8000000);
+        match rest_put(wifi, lcd, &mut buff, ESPLinkID::Conn0, remote.0, &ep.as_str(), &msg) {
+            Ok(resp) => {
+                let resp: ServerResp = resp;
+                lcd.puts(resp.status);
+            },
+            Err(_) => check_conn(wifi, ESPLinkID::Conn0, &remote)
         }
+        cx.spawn.test_send().unwrap();
+    }
+
+    #[task(priority = 1, resources = [wifi, lcd], spawn=[test_send2])]
+    fn test_send2(mut cx: test_send2::Context) {
+        let wifi = &mut cx.resources.wifi;
+        let lcd = &cx.resources.lcd;
+        let remote = ("192.168.1.120", 8080);
+        let mut id = String::<U12>::new();
+        for ch in wifi.get_mac().chars() {
+            if ch != ':' { id.push(ch).unwrap() }
+        }
+        let mut ep = String::<U32>::new();
+        //let mut ep2 = String::<U32>::new();
+        //let mut ws_cli = WSClient::new(EmptyRng::new());
+        let mut buff = Vec::<u8, U2048>::new();
+        ep.write_fmt(format_args!("/{}/update", id)).unwrap();
+        //ep2.write_fmt(format_args!("/{}/push", id)).unwrap();
+        check_conn(wifi, ESPLinkID::Conn1, &remote);
+        //buff.resize(1024, 0).unwrap();
+        //let nbytes = ws_cli.connect(remote.0, ep2.as_str(), &mut buff).unwrap();
+        //wifi.send(&buff[..nbytes], ESPLinkID::Conn1).unwrap();
+        let msg = TestMsg {
+            cmd: "hello",
+            mac: wifi.get_mac(),
+            temp: 25,
+            timestamp: 0xffff
+        };
+        cortex_m::asm::delay(8000000);
+        match rest_put(wifi, lcd, &mut buff, ESPLinkID::Conn1, remote.0, &ep.as_str(), &msg) {
+            Ok(resp) => {
+                let resp: ServerResp = resp;
+                //lcd.puts(resp.status);
+            },
+            Err(_) => check_conn(wifi, ESPLinkID::Conn1, &remote)
+        }
+        cx.spawn.test_send2().unwrap();
     }
 
     #[idle]
