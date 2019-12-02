@@ -1,16 +1,6 @@
 #![no_main]
 #![no_std]
 
-extern crate panic_halt;
-extern crate stm32f1;
-extern crate nb;
-extern crate embedded_hal;
-extern crate serde;
-extern crate stm32f1xx_hal;
-extern crate rtfm;
-extern crate serde_json_core;
-extern crate rustypill;
-
 use core::cell::RefCell;
 
 use rustypill::lcd;
@@ -20,13 +10,14 @@ use heapless::consts::*;
 use heapless::{String, Vec};
 use heapless::spsc::{Consumer, Producer, Queue};
 
-use cortex_m::{asm, singleton};
+use panic_halt as _;
+use cortex_m::asm;
 use stm32f1xx_hal::serial::{Serial, Config, Tx, Rx};
 use stm32f1xx_hal::stm32::USART1;
 use stm32f1xx_hal::prelude::*;
 use embedded_hal::digital::v2::OutputPin;
 use heapless::ArrayLength;
-use cortex_m_semihosting::{debug, hprintln};
+//use cortex_m_semihosting::{debug, hprintln};
 
 pub struct SerialRx<'a, T: ArrayLength<u8>> {
     rx_cons: Consumer<'a, u8, T>
@@ -298,7 +289,7 @@ fn check_conn<'a, T: ArrayLength<u8>>(wifi: &ESPWifi<'a, T>) {
 }
 
 fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Deserialize<'b>>(
-        wifi: &ESPWifi<'a, T>, lcd: &lcd::LCD1602, buff: &'b mut Vec<u8, U>,
+        wifi: &ESPWifi<'a, T>, _lcd: &lcd::LCD1602, buff: &'b mut Vec<u8, U>,
         host: &str,
         endpoint: &str,
         req: &R) -> Result<S, ()> {
@@ -380,7 +371,7 @@ const APP: () = {
         let mut rcc = p.RCC.constrain();
         let mut afio = p.AFIO.constrain(&mut rcc.apb2);
 
-        let cp = cx.core;
+        //let cp = cx.core;
         let mut flash = p.FLASH.constrain();
         let clocks = rcc.cfgr.freeze(&mut flash.acr);
         let mut gpioa = p.GPIOA.split(&mut rcc.apb2);
@@ -388,7 +379,7 @@ const APP: () = {
         let mut rst = gpiob.pb7.into_open_drain_output(&mut gpiob.crl);
         // reset the WiFi module and wait for boot up
         //cortex_m::asm::delay(4000000);
-        rst.set_high();
+        rst.set_high().unwrap();
         cortex_m::asm::delay(4000000);
         let lcd = lcd::LCD1602::new();
         lcd.init(lcd::LCD16X2_DISPLAY_ON_CURSOR_OFF_BLINK_OFF);
@@ -409,7 +400,7 @@ const APP: () = {
 
         serial.listen(stm32f1xx_hal::serial::Event::Rxne);
         //serial.listen(stm32f1xx_hal::serial::Event::Txe);
-        let (mut tx, mut rx) = serial.split();
+        let (tx, rx) = serial.split();
         cx.spawn.test_send().unwrap();
         init::LateResources {
             wifi: ESPWifi::new(
