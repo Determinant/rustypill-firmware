@@ -201,6 +201,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
     fn connect_ap(&self) -> Result<(), ()> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
+        esp_out.clear();
         esp_in.write("AT+CWMODE=1\r\n");
         esp_out.jump_to_marker("OK", "ERROR")?;
         let mut cmd = String::<U128>::new();
@@ -213,6 +214,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U64>::new();
+        esp_out.clear();
         cmd.write_fmt(format_args!("AT+CIPSTART={},\"TCP\",\"{}\",{}\r\n", lid as u8, ip, port)).unwrap();
         esp_in.write(cmd.as_str());
         esp_out.jump_to_marker("OK", "ERROR")
@@ -222,11 +224,11 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
+        esp_out.clear();
         for d in data.chunks(1024) {
             cmd.clear();
             cmd.write_fmt(format_args!("AT+CIPSEND={},{}\r\n", lid as u8, data.len())).unwrap();
             esp_in.write(cmd.as_str());
-            esp_out.jump_to_marker("OK", "ERROR")?;
             esp_out.jump_to_marker(">", "ERROR")?;
             esp_in.write_bytes(d);
             esp_out.jump_to_marker("SEND OK", "ERROR")?;
@@ -270,6 +272,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
+        esp_out.clear();
         cmd.write_fmt(format_args!("AT+CIPCLOSE={}\r\n", lid as u8)).unwrap();
         esp_in.write(cmd.as_str());
         esp_out.jump_to_marker("OK", "ERROR")
@@ -278,6 +281,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
     fn status(&self, lid: ESPLinkID) -> ESPConnStatus {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
+        esp_out.clear();
         esp_in.write("AT+CIPSTATUS\r\n");
         esp_out.jump_to_marker("STATUS:", "ERROR").unwrap();
         let mut _s: [u8; 1] = [0; 1];
@@ -303,6 +307,7 @@ impl<'a,  T: ArrayLength<u8>> ESPWifiInner<'a, T> {
     fn get_mac(&self, mac: &mut [u8]) {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
+        esp_out.clear();
         esp_in.write("AT+CIPSTAMAC_CUR?\r\n");
         esp_out.jump_to_marker("+CIPSTAMAC_CUR:\"", "ERROR").unwrap();
         esp_out.read(mac);
@@ -399,6 +404,7 @@ fn recv_resp<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>>(
     let mut chunk = Vec::<u8, U32>::new();
     let header_off;
     let headers;
+    buff.clear();
     chunk.resize(32, 0).unwrap();
     loop {
         let nread = wifi.recv(&mut chunk, lid).unwrap();
@@ -467,6 +473,12 @@ fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Des
 struct WSClient<T: rand_core::RngCore> {
     ws: WebSocket<T>,
     ws_key: Option<WebSocketKey>
+}
+
+impl<T: rand_core::RngCore> core::fmt::Debug for WSClient<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "WSClient")
+    }
 }
 
 impl<T: rand_core::RngCore> WSClient<T> {
@@ -601,47 +613,76 @@ const APP: () = {
         match rest_put(wifi, lcd, &mut buff, ESPLinkID::Conn0, remote.0, &ep.as_str(), &msg) {
             Ok(resp) => {
                 let resp: ServerResp = resp;
-                lcd.puts(resp.status);
+                //lcd.puts(resp.status);
             },
             Err(_) => check_conn(wifi, ESPLinkID::Conn0, &remote)
         }
         cx.spawn.test_send().unwrap();
     }
 
-    #[task(priority = 1, resources = [wifi, lcd], spawn=[test_send2])]
+    #[task(priority = 1, resources = [wifi, lcd], spawn=[test_send2_loop])]
     fn test_send2(mut cx: test_send2::Context) {
         let wifi = &mut cx.resources.wifi;
-        let lcd = &cx.resources.lcd;
         let remote = ("192.168.1.120", 8080);
         let mut id = String::<U12>::new();
         for ch in wifi.get_mac().chars() {
             if ch != ':' { id.push(ch).unwrap() }
         }
         let mut ep = String::<U32>::new();
-        //let mut ep2 = String::<U32>::new();
-        //let mut ws_cli = WSClient::new(EmptyRng::new());
+        let mut ws_cli = WSClient::new(EmptyRng::new());
         let mut buff = Vec::<u8, U2048>::new();
-        ep.write_fmt(format_args!("/{}/update", id)).unwrap();
-        //ep2.write_fmt(format_args!("/{}/push", id)).unwrap();
-        check_conn(wifi, ESPLinkID::Conn1, &remote);
-        //buff.resize(1024, 0).unwrap();
-        //let nbytes = ws_cli.connect(remote.0, ep2.as_str(), &mut buff).unwrap();
-        //wifi.send(&buff[..nbytes], ESPLinkID::Conn1).unwrap();
-        let msg = TestMsg {
-            cmd: "hello",
-            mac: wifi.get_mac(),
-            temp: 25,
-            timestamp: 0xffff
-        };
-        cortex_m::asm::delay(8000000);
-        match rest_put(wifi, lcd, &mut buff, ESPLinkID::Conn1, remote.0, &ep.as_str(), &msg) {
-            Ok(resp) => {
-                let resp: ServerResp = resp;
-                //lcd.puts(resp.status);
-            },
-            Err(_) => check_conn(wifi, ESPLinkID::Conn1, &remote)
+        let lid = ESPLinkID::Conn1;
+        ep.write_fmt(format_args!("/{}/push", id)).unwrap();
+        check_conn(wifi, lid, &remote);
+        buff.resize(1024, 0).unwrap();
+        // connect WebSocket
+        let nbytes = ws_cli.connect(remote.0, ep.as_str(), &mut buff).unwrap();
+        wifi.send(&buff[..nbytes], lid).unwrap();
+        let (_, body_end) = recv_resp(wifi, lid, &mut buff);
+        ws_cli.client_accept(&buff[..body_end]).unwrap();
+        // listen for text frames
+        cx.spawn.test_send2_loop(ws_cli, buff).unwrap();
+    }
+
+    #[task(priority = 1, resources = [wifi, lcd], spawn=[test_send2_loop])]
+    fn test_send2_loop(mut cx: test_send2_loop::Context,
+                       mut ws_cli: WSClient<EmptyRng>, mut buff: Vec<u8, U2048>) {
+        let lid = ESPLinkID::Conn1;
+        let lcd = &cx.resources.lcd;
+        let wifi = &mut cx.resources.wifi;
+        let mut wbuff = Vec::<u8, U2048>::new();
+        wbuff.resize(2048, 0).unwrap();
+        let mut chunk = Vec::<u8, U32>::new();
+        buff.clear();
+        chunk.resize(32, 0).unwrap();
+        let ret;
+        loop {
+            let nread = wifi.recv(&mut chunk, lid).unwrap();
+            if nread > 0 {
+                buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
+                match ws_cli.recv_text_frame(&buff, &mut wbuff) {
+                    Ok(_ret) => {
+                        if _ret.end_of_message {
+                            ret = _ret;
+                            break
+                        }
+                    },
+                    Err(_) => asm::bkpt()
+                }
+            }
         }
-        cx.spawn.test_send2().unwrap();
+        chunk.clear();
+        chunk.extend_from_slice(&buff[ret.len_from..]).unwrap();
+        match ret.message_type {
+            WebSocketReceiveMessageType::Text => lcd.puts(core::str::from_utf8(&wbuff[..ret.len_from]).unwrap()),
+            WebSocketReceiveMessageType::Ping => lcd.puts("ping!"),
+            _ => asm::bkpt(),
+        }
+
+        // put the leftover
+        buff.clear();
+        buff.extend_from_slice(&chunk).unwrap();
+        cx.spawn.test_send2_loop(ws_cli, buff).unwrap();
     }
 
     #[idle]
@@ -651,7 +692,7 @@ const APP: () = {
         }
     }
 
-    #[task(binds = USART1, priority = 3, resources = [rx, rx_prod])]
+    #[task(binds = USART1, priority = 2, resources = [rx, rx_prod])]
     fn usart1_rx(cx: usart1_rx::Context) {
         let rx = cx.resources.rx;
         loop {
