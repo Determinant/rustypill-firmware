@@ -123,10 +123,10 @@ pub struct ESPWifi<'a, T: ArrayLength<u8>> {
 
 fn gen_json_rest<T: ArrayLength<u8>>(ep: &str, host: &str, json: &str, rest: &mut String<T>) {
     rest.write_fmt(format_args!(
-        "PUT {} HTTP/1.1\n\
-         Host: {}\n\
-         Content-type: json/application\n\
-         Content-length: {}\n\n\
+        "PUT {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Content-type: json/application\r\n\
+         Content-length: {}\r\n\r\n\
          {}", ep, host, json.len(), json)).unwrap()
 }
 
@@ -253,6 +253,7 @@ struct TestMsg<'a> {
     timestamp: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ServerResp<'a> {
     status: &'a str
 }
@@ -262,25 +263,18 @@ fn check_conn<'a, T: ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1
         ESPConnStatus::NoWifi => {
             while let Err(_) = wifi.connect_ap() {
                 cortex_m::asm::delay(40000000);
-                lcd.puts("wifi failed.\n");
             }
-            lcd.puts("wifi ready.\n");
             while let Err(_) = wifi.connect("192.168.1.120", 8080) {
                 cortex_m::asm::delay(40000000);
-                lcd.puts("conn failed.\n");
             }
-            lcd.puts("conn ready1.\n");
         },
         ESPConnStatus::NoConn => {
             while let Err(_) = wifi.connect("192.168.1.120", 8080) {
                 cortex_m::asm::delay(40000000);
-                lcd.puts("conn failed.\n");
             }
-            lcd.puts("conn ready2.\n");
         }
         _ => return
     }
-    //lcd.puts("connected.\n")
 }
 
 fn test_send_loop<'a, T: ArrayLength<u8>>(id: &str, wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) -> Result<(), ()> {
@@ -302,11 +296,57 @@ fn test_send_loop<'a, T: ArrayLength<u8>>(id: &str, wifi: &mut ESPWifi<'a, T>, l
         wifi.send(rest.as_str().as_bytes())?;
     }
     {
-        let mut got = Vec::<_, U2048>::new();
-        got.resize(2048, 0).unwrap();
-        cortex_m::asm::delay(4000000);
-        let nread = wifi.recv(&mut got).unwrap();
-        lcd.puts(core::str::from_utf8(&got[..nread as usize]).unwrap());
+        let mut buff = Vec::<u8, U2048>::new();
+        let mut chunk = Vec::<u8, U32>::new();
+        let header_off;
+        let headers;
+        chunk.resize(32, 0).unwrap();
+        loop {
+            let nread = wifi.recv(&mut chunk).unwrap();
+            if nread > 0 {
+                buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
+                let mut _headers = [httparse::EMPTY_HEADER; 16];
+                let mut resp = httparse::Response::new(&mut _headers);
+                if let httparse::Status::Complete(off) = resp.parse(&buff).unwrap() {
+                    header_off = off;
+                    headers = _headers;
+                    break
+                }
+            }
+        }
+        const LENGTH_NAME: &str = "Content-Length";
+        let mut end = header_off;
+        for h in headers.iter() {
+            if h.name.len() != LENGTH_NAME.len() { continue }
+            let mut flag = true;
+            for (a, b) in h.name.as_bytes().iter().zip(LENGTH_NAME.as_bytes()) {
+                let a = *a;
+                let b = *b;
+                let a = if a < 97 { a + 32 } else { a };
+                let b = if b < 97 { b + 32 } else { b };
+                if a != b {
+                    flag = false;
+                    break
+                }
+            }
+            if flag { 
+                let length: usize = core::str::from_utf8(h.value).unwrap().parse().unwrap();
+                end += length;
+            }
+        }
+        loop {
+            let nread = wifi.recv(&mut chunk).unwrap();
+            if nread > 0 {
+                buff.extend_from_slice(&chunk[..nread as usize]).unwrap();
+                if buff.len() >= end {
+                    break
+                }
+            }
+        }
+        let resp_json = core::str::from_utf8(&buff[header_off..end]).unwrap();
+        let status: ServerResp = serde_json_core::from_str(resp_json).unwrap();
+        lcd.puts(status.status);
+        lcd.putc('\n');
     }
     Ok(())
 }
