@@ -11,6 +11,8 @@ extern crate rtfm;
 extern crate serde_json_core;
 extern crate rustypill;
 
+use core::cell::RefCell;
+
 use rustypill::lcd;
 use serde::{Deserialize, Serialize};
 use core::fmt::Write;
@@ -114,8 +116,8 @@ pub enum ESPConnStatus {
 }
 
 pub struct ESPWifi<'a, T: ArrayLength<u8>> {
-    esp_in: SerialTx,
-    esp_out: SerialRx<'a, T>,
+    esp_in: RefCell<SerialTx>,
+    esp_out: RefCell<SerialRx<'a, T>>,
     mac: [u8; 17],
     ssid: String<U16>,
     password: String<U32>,
@@ -135,8 +137,8 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
                esp_out: SerialRx<'a, T>,
                ssid: &str, password: &str) -> Self {
         ESPWifi {
-            esp_in,
-            esp_out,
+            esp_in: RefCell::new(esp_in),
+            esp_out: RefCell::new(esp_out),
             mac: [0; 17],
             ssid: String::from(ssid),
             password: String::from(password)
@@ -144,65 +146,77 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
     }
 
     pub fn init(&mut self) -> Result<(), ()> {
-        self.esp_in.write("ATE0\r\n");
-        self.esp_out.jump_to_marker("OK", "ERROR")?;
-        self.esp_in.write("AT+CIPRECVMODE=1\r\n");
-        self.esp_out.jump_to_marker("OK", "ERROR")?;
+        {
+            let mut esp_in = self.esp_in.borrow_mut();
+            let mut esp_out = self.esp_out.borrow_mut();
+            esp_in.write("ATE0\r\n");
+            esp_out.jump_to_marker("OK", "ERROR")?;
+            esp_in.write("AT+CIPRECVMODE=1\r\n");
+            esp_out.jump_to_marker("OK", "ERROR")?;
+        }
         self._get_mac();
         Ok(())
     }
 
-    pub fn connect_ap(&mut self) -> Result<(), ()> {
-        self.esp_in.write("AT+CWMODE=1\r\n");
-        self.esp_out.jump_to_marker("OK", "ERROR")?;
+    pub fn connect_ap(&self) -> Result<(), ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
+        esp_in.write("AT+CWMODE=1\r\n");
+        esp_out.jump_to_marker("OK", "ERROR")?;
         let mut cmd = String::<U128>::new();
         cmd.write_fmt(format_args!("AT+CWJAP_CUR=\"{}\",\"{}\"\r\n", self.ssid, self.password)).unwrap();
-        self.esp_in.write(cmd.as_str());
-        self.esp_out.jump_to_marker("OK", "ERROR")
+        esp_in.write(cmd.as_str());
+        esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn connect(&mut self, ip: &str, port: u16) -> Result<(), ()> {
+    pub fn connect(&self, ip: &str, port: u16) -> Result<(), ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U64>::new();
         cmd.write_fmt(format_args!("AT+CIPSTART=\"TCP\",\"{}\",{}\r\n", ip, port)).unwrap();
-        self.esp_in.write(cmd.as_str());
-        self.esp_out.jump_to_marker("OK", "ERROR")
+        esp_in.write(cmd.as_str());
+        esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+    pub fn send(&self, data: &[u8]) -> Result<(), ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
         for d in data.chunks(1024) {
             cmd.clear();
             cmd.write_fmt(format_args!("AT+CIPSEND={}\r\n", data.len())).unwrap();
-            self.esp_in.write(cmd.as_str());
-            self.esp_out.jump_to_marker("OK", "ERROR")?;
-            self.esp_out.jump_to_marker(">", "ERROR")?;
-            self.esp_in.write_bytes(d);
-            self.esp_out.jump_to_marker("SEND OK", "ERROR")?;
+            esp_in.write(cmd.as_str());
+            esp_out.jump_to_marker("OK", "ERROR")?;
+            esp_out.jump_to_marker(">", "ERROR")?;
+            esp_in.write_bytes(d);
+            esp_out.jump_to_marker("SEND OK", "ERROR")?;
         }
         Ok(())
     }
 
-    pub fn recv(&mut self, data: &mut [u8]) -> Result<u16, ()> {
+    pub fn recv(&self, data: &mut [u8]) -> Result<u16, ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
         let mut cmd = String::<U32>::new();
         let mut len: [u8; 8] = [0; 8];
         let mut nread = 0;
-        self.esp_out.clear();
+        esp_out.clear();
         for d in data.chunks_mut(1024) {
             cmd.clear();
             cmd.write_fmt(format_args!("AT+CIPRECVDATA={}\r\n", d.len())).unwrap();
-            self.esp_in.write(cmd.as_str());
-            match self.esp_out.jump_to_marker("+CIPRECVDATA,", "OK") {
+            esp_in.write(cmd.as_str());
+            match esp_out.jump_to_marker("+CIPRECVDATA,", "OK") {
                 Ok(_) => {
                     // read length int
-                    let t = self.esp_out.read_until(':' as u8, &mut len);
+                    let t = esp_out.read_until(':' as u8, &mut len);
                     let clen: u16 = core::str::from_utf8(&len[..t as usize]).unwrap().parse().unwrap();
                     // read the chunk of data
-                    self.esp_out.read(&mut d[..clen as usize]);
+                    esp_out.read(&mut d[..clen as usize]);
                     nread += clen;
                     if (clen as usize) < d.len() {
                         break
                     }
-                    self.esp_out.jump_to_marker("OK", "ERROR")?;
+                    esp_out.jump_to_marker("OK", "ERROR")?;
                 },
                 Err(_) => {
                     break
@@ -212,17 +226,21 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
         Ok(nread)
     }
 
-    pub fn disconnect(&mut self) -> Result<(), ()> {
-        self.esp_in.write("AT+CIPCLOSE\r\n");
-        self.esp_out.jump_to_marker("OK", "ERROR")
+    pub fn disconnect(&self) -> Result<(), ()> {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
+        esp_in.write("AT+CIPCLOSE\r\n");
+        esp_out.jump_to_marker("OK", "ERROR")
     }
 
-    pub fn status(&mut self) -> ESPConnStatus {
-        self.esp_in.write("AT+CIPSTATUS\r\n");
-        self.esp_out.jump_to_marker("STATUS:", "ERROR").unwrap();
+    pub fn status(&self) -> ESPConnStatus {
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
+        esp_in.write("AT+CIPSTATUS\r\n");
+        esp_out.jump_to_marker("STATUS:", "ERROR").unwrap();
         let mut _s: [u8; 1] = [0; 1];
-        self.esp_out.read(&mut _s);
-        self.esp_out.jump_to_marker("OK", "ERROR").unwrap();
+        esp_out.read(&mut _s);
+        esp_out.jump_to_marker("OK", "ERROR").unwrap();
         let code: u8 = core::str::from_utf8(&_s).unwrap().parse().unwrap();
         match code {
             2 => ESPConnStatus::NoConn,
@@ -234,10 +252,12 @@ impl<'a,  T: ArrayLength<u8>> ESPWifi<'a, T> {
     }
 
     fn _get_mac(&mut self) {
-        self.esp_in.write("AT+CIPSTAMAC_CUR?\r\n");
-        self.esp_out.jump_to_marker("+CIPSTAMAC_CUR:\"", "ERROR").unwrap();
-        self.esp_out.read(&mut self.mac);
-        self.esp_out.jump_to_marker("OK", "ERROR").unwrap();
+        let mut esp_in = self.esp_in.borrow_mut();
+        let mut esp_out = self.esp_out.borrow_mut();
+        esp_in.write("AT+CIPSTAMAC_CUR?\r\n");
+        esp_out.jump_to_marker("+CIPSTAMAC_CUR:\"", "ERROR").unwrap();
+        esp_out.read(&mut self.mac);
+        esp_out.jump_to_marker("OK", "ERROR").unwrap();
     }
 
     fn get_mac(&self) -> &str {
@@ -258,7 +278,7 @@ struct ServerResp<'a> {
     status: &'a str
 }
 
-fn check_conn<'a, T: ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) {
+fn check_conn<'a, T: ArrayLength<u8>>(wifi: &ESPWifi<'a, T>) {
     match wifi.status() {
         ESPConnStatus::NoWifi => {
             while let Err(_) = wifi.connect_ap() {
@@ -277,26 +297,18 @@ fn check_conn<'a, T: ArrayLength<u8>>(wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1
     }
 }
 
-fn test_send_loop<'a, T: ArrayLength<u8>>(id: &str, wifi: &mut ESPWifi<'a, T>, lcd: &lcd::LCD1602) -> Result<(), ()> {
-    let msg = TestMsg {
-        cmd: "hi",
-        mac: wifi.get_mac(),
-        temp: 24,
-        timestamp: 0xffff
-    };
+fn rest_put<'a, 'b, T: ArrayLength<u8>, U: ArrayLength<u8>, R: Serialize, S: Deserialize<'b>>(
+        wifi: &ESPWifi<'a, T>, lcd: &lcd::LCD1602, buff: &'b mut Vec<u8, U>,
+        host: &str,
+        endpoint: &str,
+        req: &R) -> Result<S, ()> {
     {
         let mut rest = String::<U2048>::new();
-        {
-            let json: String<U2048> = serde_json_core::to_string(&msg).unwrap();
-            let mut ep = String::<U32>::new();
-            ep.write_fmt(format_args!("/{}", id)).unwrap();
-            gen_json_rest(ep.as_str(), "192.168.1.120", json.as_str(), &mut rest)
-                //wifi.send("hello, world!\n".as_bytes())?;
-        }
+        let json: String<U2048> = serde_json_core::to_string(&req).unwrap();
+        gen_json_rest(endpoint, host, json.as_str(), &mut rest);
         wifi.send(rest.as_str().as_bytes())?;
     }
     {
-        let mut buff = Vec::<u8, U2048>::new();
         let mut chunk = Vec::<u8, U32>::new();
         let header_off;
         let headers;
@@ -344,11 +356,8 @@ fn test_send_loop<'a, T: ArrayLength<u8>>(id: &str, wifi: &mut ESPWifi<'a, T>, l
             }
         }
         let resp_json = core::str::from_utf8(&buff[header_off..end]).unwrap();
-        let status: ServerResp = serde_json_core::from_str(resp_json).unwrap();
-        lcd.puts(status.status);
-        lcd.putc('\n');
+        Ok(serde_json_core::from_str(resp_json).unwrap())
     }
-    Ok(())
 }
 
 #[rtfm::app(device = stm32f1xx_hal::stm32, peripherals = true)]
@@ -424,10 +433,23 @@ const APP: () = {
         for ch in wifi.get_mac().chars() {
             if ch != ':' { id.push(ch).unwrap() }
         }
-        check_conn(wifi, lcd);
+        let mut ep = String::<U32>::new();
+        ep.write_fmt(format_args!("/{}", id)).unwrap();
+        check_conn(wifi);
+        let msg = TestMsg {
+            cmd: "hi",
+            mac: wifi.get_mac(),
+            temp: 24,
+            timestamp: 0xffff
+        };
         loop {
-            if let Err(_) = test_send_loop(id.as_str(), wifi, lcd) {
-                check_conn(wifi, lcd)
+            let mut buff = Vec::<u8, U2048>::new();
+            match rest_put(wifi, lcd, &mut buff, ep.as_str(), "192.168.1.120", &msg) {
+                Ok(resp) => {
+                    let resp: ServerResp = resp;
+                    lcd.puts(resp.status);
+                },
+                Err(_) => check_conn(wifi)
             }
             cortex_m::asm::delay(8000000);
         }
