@@ -1,14 +1,9 @@
 use core::fmt::Write;
 use core::cell::RefCell;
-use heapless::{consts::*, String, ArrayLength};
-use heapless::spsc::Consumer;
-use stm32f1xx_hal::prelude::*;
-use stm32f1xx_hal::serial::Tx;
-use stm32f1xx_hal::stm32::{USART1, USART2, USART3};
+use heapless::{consts::*, String};
 use crate::util::GeneralError;
 use crate::sync::Mutex;
 
-#[inline(always)]
 pub fn parse_from_utf8<T: core::str::FromStr>(s: &[u8]) -> Result<T, WifiError> {
     core::str::from_utf8(s)
         .or(Err(SerialParseError))?.parse()
@@ -20,66 +15,21 @@ macro_rules! wwrite {
     ($dst:expr, $($arg:tt)*) => ($crate::write!($dst, $($arg)*).or_else(|e| Err(WifiOtherError(e))))
 }
 
-pub trait SerialRxPin {
+pub trait SerialRx {
     fn read(&mut self) -> u8;
     fn clear(&mut self);
 }
 
-pub trait SerialTxPin {
+pub trait SerialTx {
     fn write(&mut self, word: u8);
     fn flush(&mut self);
 }
 
-pub struct SerialRxQueue<'a, T: ArrayLength<u8>>(Consumer<'a, u8, T>);
+struct ESPTx<T: SerialTx>(T);
 
-pub struct SerialTxQueue<USART>(Tx<USART>);
-
-macro_rules! gen_serialtxqueue {
-    ($USARTX: ident) => {
-        impl SerialTxQueue<$USARTX> {
-            pub fn new(tx: Tx<$USARTX>) -> Self {
-                SerialTxQueue(tx)
-            }
-        }
-
-        impl SerialTxPin for SerialTxQueue<$USARTX> {
-            fn write(&mut self, word: u8) {
-                nb::block!(self.0.write(word)).unwrap()
-            }
-
-            fn flush(&mut self) {
-                nb::block!(self.0.flush()).unwrap()
-            }
-        }
-    }
-}
-
-gen_serialtxqueue!(USART1);
-gen_serialtxqueue!(USART2);
-gen_serialtxqueue!(USART3);
-
-impl<'a, T: ArrayLength<u8>> SerialRxQueue<'a, T> {
-    pub fn new(cons: Consumer<'a, u8, T>) -> Self {
-        SerialRxQueue(cons)
-    }
-}
-
-impl<'a, T: ArrayLength<u8>> SerialRxPin for SerialRxQueue<'a, T> {
-    fn read(&mut self) -> u8{
-        while !self.0.ready() {}
-        self.0.dequeue().unwrap()
-    }
-
-    fn clear(&mut self) {
-        while let Some(_) = self.0.dequeue() {}
-    }
-}
-
-struct SerialTx<T: SerialTxPin>(T);
-
-impl<T: SerialTxPin> SerialTx<T> {
+impl<T: SerialTx> ESPTx<T> {
     pub fn new(pin: T) -> Self {
-        SerialTx(pin)
+        ESPTx(pin)
     }
 
     pub fn write(&mut self, text: &str) {
@@ -94,11 +44,11 @@ impl<T: SerialTxPin> SerialTx<T> {
     }
 }
 
-struct SerialRx<T: SerialRxPin>(T);
+struct ESPRx<T: SerialRx>(T);
 
-impl<T: SerialRxPin> SerialRx<T> {
+impl<T: SerialRx> ESPRx<T> {
     pub fn new(pin: T) -> Self {
-        SerialRx(pin)
+        ESPRx(pin)
     }
     pub fn jump_to_marker(&mut self, resp_marker: &str, err_marker: &str) -> Result<(), WifiError> {
         let (rm, em) = (resp_marker.as_bytes(), err_marker.as_bytes());
@@ -170,19 +120,19 @@ pub enum ESPConnStatus {
     Connected
 }
 
-struct ESPWifiInner<T: SerialTxPin, R: SerialRxPin> {
-    esp_in: RefCell<SerialTx<T>>,
-    esp_out: RefCell<SerialRx<R>>,
+struct ESPWifiInner<T: SerialTx, R: SerialRx> {
+    esp_in: RefCell<ESPTx<T>>,
+    esp_out: RefCell<ESPRx<R>>,
     ssid: String<U16>,
     password: String<U32>,
 }
 
-pub struct ESPWifi<T: SerialTxPin, R: SerialRxPin> {
+pub struct ESPWifi<T: SerialTx, R: SerialRx> {
     inner: Mutex<ESPWifiInner<T, R>>,
     mac: [u8; 17],
 }
 
-impl<T: SerialTxPin, R: SerialRxPin> ESPWifiInner<T, R> {
+impl<T: SerialTx, R: SerialRx> ESPWifiInner<T, R> {
     fn init(&self) -> Result<(), WifiError> {
         let mut esp_in = self.esp_in.borrow_mut();
         let mut esp_out = self.esp_out.borrow_mut();
@@ -318,14 +268,14 @@ impl<T: SerialTxPin, R: SerialRxPin> ESPWifiInner<T, R> {
 }
 
 
-impl<T: SerialTxPin, R: SerialRxPin> ESPWifi<T, R> {
+impl<T: SerialTx, R: SerialRx> ESPWifi<T, R> {
     pub fn new(esp_in: T,
                esp_out: R,
                ssid: &str, password: &str) -> Self {
         ESPWifi{
             inner: Mutex::new(ESPWifiInner {
-                esp_in: RefCell::new(SerialTx::new(esp_in)),
-                esp_out: RefCell::new(SerialRx::new(esp_out)),
+                esp_in: RefCell::new(ESPTx::new(esp_in)),
+                esp_out: RefCell::new(ESPRx::new(esp_out)),
                 ssid: String::from(ssid),
                 password: String::from(password)
             }),

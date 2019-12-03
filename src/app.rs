@@ -5,22 +5,66 @@ use serde::{Deserialize, Serialize};
 use core::fmt::Write;
 use heapless::consts::*;
 use heapless::{String, Vec};
-use heapless::spsc::{Producer, Queue};
+use heapless::spsc::{Producer, Consumer, Queue};
 
 use panic_halt as _;
 use cortex_m::{asm};
-use stm32f1xx_hal::serial::{Serial, Config, Rx};
-use stm32f1xx_hal::stm32::USART1;
+use stm32f1xx_hal::serial::{Serial, Config, Tx, Rx};
+use stm32f1xx_hal::stm32::{USART1, USART2, USART3};
 use stm32f1xx_hal::prelude::*;
 use embedded_hal::digital::v2::OutputPin;
 use heapless::ArrayLength;
 
 use embedded_websocket as ws;
-use ws::{EmptyRng, WebSocket, WebSocketOptions, WebSocketReceiveMessageType, WebSocketKey};
+use ws::{EmptyRng, WebSocketReceiveMessageType};
 //use cortex_m_semihosting::{debug, hprintln};
 
 use rustypill::{lcd, net};
-use rustypill::esp8266::{ESPLinkID, ESPConnStatus, ESPWifi, SerialTxPin, SerialRxPin, SerialTxQueue, SerialRxQueue};
+use rustypill::esp8266::{ESPLinkID, ESPConnStatus, ESPWifi, SerialTx, SerialRx};
+
+pub struct SerialRxQueue<'a, T: ArrayLength<u8>>(Consumer<'a, u8, T>);
+
+pub struct SerialTxQueue<USART>(Tx<USART>);
+
+macro_rules! gen_serialtxqueue {
+    ($USARTX: ident) => {
+        impl SerialTxQueue<$USARTX> {
+            pub fn new(tx: Tx<$USARTX>) -> Self {
+                SerialTxQueue(tx)
+            }
+        }
+
+        impl SerialTx for SerialTxQueue<$USARTX> {
+            fn write(&mut self, word: u8) {
+                nb::block!(self.0.write(word)).unwrap()
+            }
+
+            fn flush(&mut self) {
+                nb::block!(self.0.flush()).unwrap()
+            }
+        }
+    }
+}
+
+gen_serialtxqueue!(USART1);
+
+impl<'a, T: ArrayLength<u8>> SerialRxQueue<'a, T> {
+    pub fn new(cons: Consumer<'a, u8, T>) -> Self {
+        SerialRxQueue(cons)
+    }
+}
+
+impl<'a, T: ArrayLength<u8>> SerialRx for SerialRxQueue<'a, T> {
+    fn read(&mut self) -> u8{
+        while !self.0.ready() {}
+        self.0.dequeue().unwrap()
+    }
+
+    fn clear(&mut self) {
+        while let Some(_) = self.0.dequeue() {}
+    }
+}
+
 
 #[derive(Serialize, Deserialize)]
 struct TestMsg<'a> {
@@ -35,7 +79,7 @@ struct ServerResp<'a> {
     status: &'a str
 }
 
-fn check_conn<'a, T: SerialTxPin, R: SerialRxPin>(wifi: &ESPWifi<T, R>, lid: ESPLinkID, remote: &(&str, u16)) {
+fn check_conn<'a, T: SerialTx, R: SerialRx>(wifi: &ESPWifi<T, R>, lid: ESPLinkID, remote: &(&str, u16)) {
     match wifi.status(lid) {
         Ok(s) => match s {
             ESPConnStatus::NoWifi => {
@@ -66,8 +110,7 @@ const APP: () = {
         rx: Rx<USART1>,
         rx_prod: Producer<'static, u8, U2048>,
         wifi: ESPWifi<WifiTx, WifiRx>,
-        #[init(None)]
-        ws: Option<net::WSClient<'static, EmptyRng, WifiTx, WifiRx, U2048>>,
+        ws: net::WSClient<EmptyRng, U2048>,
         lcd: lcd::LCD1602
     }
 
@@ -118,12 +161,15 @@ const APP: () = {
             "R1F",
             "worldhello"
         );
+        let ws = net::WSClient::new(
+            EmptyRng::new(), ESPLinkID::Conn1, Vec::<u8, U2048>::new());
         cx.spawn.test().unwrap();
         init::LateResources {
             wifi,
             rx,
             rx_prod,
-            lcd
+            lcd,
+            ws
         }
     }
 
@@ -172,26 +218,23 @@ const APP: () = {
             if ch != ':' { id.push(ch).unwrap() }
         }
         let mut ep = String::<U32>::new();
-        *cx.resources.ws = Some(net::WSClient::new(
-            EmptyRng::new(), wifi, ESPLinkID::Conn1, Vec::<u8, U2048>::new()));
-        let ws = cx.resources.ws.as_ref().unwrap();
+        let ws = &mut cx.resources.ws;
         let lid = ESPLinkID::Conn1;
         ep.write_fmt(format_args!("/{}/push", id)).unwrap();
         check_conn(wifi, lid, &remote);
         // connect WebSocket
-        ws.connect(remote.0, ep.as_str()).unwrap();
-        ws.client_accept().unwrap();
+        ws.connect(wifi, remote.0, ep.as_str()).unwrap();
+        ws.client_accept(wifi).unwrap();
         // listen for text frames
         cx.spawn.test_send2_loop().unwrap();
     }
 
     #[task(priority = 1, resources = [wifi, lcd, ws], spawn=[test_send2_loop])]
     fn test_send2_loop(mut cx: test_send2_loop::Context) {
-        let lid = ESPLinkID::Conn1;
         let lcd = &cx.resources.lcd;
         let wifi = &mut cx.resources.wifi;
         let mut buff: [u8; 1024] = [0; 1024];
-        let (mt, n) = cx.resources.ws.as_ref().unwrap().recv_text_frame(&mut buff).unwrap();
+        let (mt, n) = cx.resources.ws.recv_text_frame(wifi, &mut buff).unwrap();
         match mt {
             WebSocketReceiveMessageType::Text => lcd.puts(core::str::from_utf8(&buff[..n]).unwrap()),
             WebSocketReceiveMessageType::Ping => lcd.puts("ping!"),

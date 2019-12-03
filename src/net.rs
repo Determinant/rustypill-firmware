@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use embedded_websocket as ws;
 use ws::{WebSocket, WebSocketOptions, WebSocketReceiveMessageType, WebSocketKey};
 use crate::util::{GeneralError};
-use crate::esp8266::{ESPLinkID, ESPWifi, WifiError, SerialTxPin, SerialRxPin, WifiError::*};
+use crate::esp8266::{ESPLinkID, ESPWifi, WifiError, SerialTx, SerialRx, WifiError::*};
 
 macro_rules! vec_extend {
     ($dst:expr, $s:expr) => ($dst.extend_from_slice($s).or(Err(WifiOtherError(GeneralError::BufferOverflowError))))
@@ -14,7 +14,7 @@ pub fn recv_http_resp<'b, T, R, U>(
         wifi: &ESPWifi<T, R>, lid: ESPLinkID,
         buff: &'b mut Vec<u8, U>) -> Result<(usize, usize), WifiError>
         where U: ArrayLength<u8>,
-              T: SerialTxPin, R: SerialRxPin {
+              T: SerialTx, R: SerialRx {
     let mut chunk = Vec::<u8, U32>::new();
     let header_off;
     let headers;
@@ -88,7 +88,7 @@ pub fn put_rest<'b, T, R, U, V, S>(
         host: &str,
         endpoint: &str,
         req: &V) -> Result<S, WifiError> where
-        T: SerialTxPin, R: SerialRxPin,
+        T: SerialTx, R: SerialRx,
         U: ArrayLength<u8>,
         V: Serialize, S: Deserialize<'b> {
     let json: String<U> = serde_json_core::to_string(&req).or(Err(JSONGenError))?;
@@ -99,36 +99,33 @@ pub fn put_rest<'b, T, R, U, V, S>(
     serde_json_core::from_slice(&buff[body_off..body_end]).or(Err(JSONParseError))
 }
 
-pub struct WSClient<'a, W: rand_core::RngCore, T: SerialTxPin, R: SerialRxPin, U: ArrayLength<u8>> {
+pub struct WSClient<W: rand_core::RngCore, U: ArrayLength<u8>> {
     ws: WebSocket<W>,
     ws_key: Option<WebSocketKey>,
-    wifi: &'a ESPWifi<T, R>,
     lid: ESPLinkID,
     buff: Vec<u8, U>
 }
 
-impl<'a, W, T, R, U> core::fmt::Debug for WSClient<'a, W, T, R, U> where
-        W: rand_core::RngCore,
-        T: SerialTxPin, R: SerialRxPin, U: ArrayLength<u8> {
+impl<W, U> core::fmt::Debug for WSClient<W, U> where
+        W: rand_core::RngCore, U: ArrayLength<u8> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "WSClient")
     }
 }
 
-impl<'a, W, T, R, U> WSClient<'a, W, T, R, U> where
-        W: rand_core::RngCore,
-        T: SerialTxPin, R: SerialRxPin, U: ArrayLength<u8> {
-    pub fn new(rng: W, wifi: &'a ESPWifi<T, R>, lid: ESPLinkID, buff: Vec<u8, U>) -> Self {
+impl<W, U> WSClient<W, U> where
+        W: rand_core::RngCore, U: ArrayLength<u8> {
+    pub fn new(rng: W, lid: ESPLinkID, buff: Vec<u8, U>) -> Self {
         WSClient {
             ws: ws::WebSocket::new_client(rng),
             ws_key: None,
-            wifi,
             lid,
             buff
         }
     }
 
-    pub fn connect(&mut self, host: &str, endpoint: &str) -> Result<(), WifiError> {
+    pub fn connect<T, R>(&mut self, wifi: &mut ESPWifi<T, R>, host: &str, endpoint: &str) -> Result<(), WifiError>
+            where T: SerialTx, R: SerialRx {
         self.buff.resize(1024, 0).unwrap();
         let websocket_options = WebSocketOptions {
             path: endpoint,
@@ -140,11 +137,12 @@ impl<'a, W, T, R, U> WSClient<'a, W, T, R, U> where
         let (n, k) = self.ws.client_connect(
             &websocket_options, &mut self.buff).or(Err(WSError))?;
         self.ws_key = Some(k);
-        self.wifi.send(&self.buff[..n], self.lid)
+        wifi.send(&self.buff[..n], self.lid)
     }
 
-    pub fn client_accept(&mut self) -> Result<(), WifiError> {
-        let (_, body_end) = recv_http_resp(self.wifi, self.lid, &mut self.buff)?;
+    pub fn client_accept<T, R>(&mut self, wifi: &mut ESPWifi<T, R>) -> Result<(), WifiError>
+            where T: SerialTx, R: SerialRx {
+        let (_, body_end) = recv_http_resp(wifi, self.lid, &mut self.buff)?;
         match self.ws_key.as_mut() {
             Some(k) => self.ws.client_accept(&k, &self.buff[..body_end])
                               .and(Ok(())).or(Err(WSError)),
@@ -160,14 +158,15 @@ impl<'a, W, T, R, U> WSClient<'a, W, T, R, U> where
         self.ws.read(&self.buff, out_buff).or(Err(()))
     }
 
-    pub fn recv_text_frame<B: ArrayLength<u8>>(&mut self, wbuff: &mut [u8]) ->
-            Result<(WebSocketReceiveMessageType, usize), WifiError> {
+    pub fn recv_text_frame<T, R>(&mut self, wifi: &mut ESPWifi<T, R>, wbuff: &mut [u8]) ->
+            Result<(WebSocketReceiveMessageType, usize), WifiError>
+            where T: SerialTx, R: SerialRx {
         let mut chunk = Vec::<u8, U32>::new();
         self.buff.clear();
         chunk.resize(32, 0).unwrap();
         let ret;
         loop {
-            let nread = self.wifi.recv(&mut chunk, self.lid).unwrap();
+            let nread = wifi.recv(&mut chunk, self.lid).unwrap();
             if nread > 0 {
                 vec_extend!(self.buff, &chunk[..nread as usize])?;
                 match self.try_recv_text_frame(wbuff) {

@@ -1,5 +1,5 @@
-extern crate stm32f1;
-use stm32f1::stm32f103::{Interrupt, Peripherals, CorePeripherals, GPIOA, GPIOB, RCC, AFIO, gpioa, rcc, afio};
+#![allow(dead_code)]
+use stm32f1::stm32f103::{GPIOA, GPIOB, AFIO, gpioa, afio};
 
 const SYSTICK_CYCLE: u32 = 8_000_000;
 const LCD16X2_DELAY_ENABLE_PULSE: u32 = 2;
@@ -52,7 +52,6 @@ pub fn delay_us(us: u32) {
 
 macro_rules! make_crh_func {
     ($f: ident, $r: ident) => {
-        #[inline(always)]
         fn $f(crh: &mut gpioa::crh::W, v: u8) -> &mut gpioa::crh::W {
             crh.$r().bits(v)
         }
@@ -61,7 +60,6 @@ macro_rules! make_crh_func {
 
 macro_rules! make_crl_func {
     ($f: ident, $r: ident) => {
-        #[inline(always)]
         fn $f(crl: &mut gpioa::crl::W, v: u8) -> &mut gpioa::crl::W {
             crl.$r().bits(v)
         }
@@ -70,7 +68,6 @@ macro_rules! make_crl_func {
 
 macro_rules! make_bsrr_func {
     ($f: ident, $r: ident) => {
-        #[inline(always)]
         fn $f(crh: &mut gpioa::bsrr::W) -> &mut gpioa::bsrr::W {
             crh.$r().set_bit()
         }
@@ -79,7 +76,6 @@ macro_rules! make_bsrr_func {
 
 macro_rules! make_brr_func {
     ($f: ident, $r: ident) => {
-        #[inline(always)]
         fn $f(crh: &mut gpioa::brr::W) -> &mut gpioa::brr::W {
             crh.$r().set_bit()
         }
@@ -88,7 +84,6 @@ macro_rules! make_brr_func {
 
 macro_rules! make_idr_func {
     ($f: ident, $r: ident) => {
-        #[inline(always)]
         fn $f(idr: &gpioa::idr::R) -> gpioa::idr::IDR0R {
             idr.$r()
         }
@@ -343,7 +338,7 @@ impl LCD1602 {
     }
 
     fn new_line(&self, pos: u8) {
-        let mut address_counter: u8 = 0;
+        let address_counter;
         if pos < LCD16X2_START_LINE_2 {
             address_counter = LCD16X2_START_LINE_2;
         }
