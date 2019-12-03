@@ -7,10 +7,11 @@ use heapless::consts::*;
 use heapless::{String, Vec};
 use heapless::spsc::{Producer, Consumer, Queue};
 
-use panic_halt as _;
+//use panic_halt as _;
+use panic_semihosting as _;
 use cortex_m::{asm};
 use stm32f1xx_hal::serial::{Serial, Config, Tx, Rx};
-use stm32f1xx_hal::stm32::{USART1, USART2, USART3};
+use stm32f1xx_hal::stm32::USART1;
 use stm32f1xx_hal::prelude::*;
 use embedded_hal::digital::v2::OutputPin;
 use heapless::ArrayLength;
@@ -132,7 +133,7 @@ const APP: () = {
         let mut gpiob = p.GPIOB.split(&mut rcc.apb2);
         let mut rst = gpiob.pb7.into_open_drain_output(&mut gpiob.crl);
         // reset the WiFi module and wait for boot up
-        //cortex_m::asm::delay(4000000);
+        cortex_m::asm::delay(100000);
         rst.set_high().unwrap();
         cortex_m::asm::delay(4000000);
         let lcd = lcd::LCD1602::new();
@@ -201,7 +202,7 @@ const APP: () = {
         cortex_m::asm::delay(8000000);
         match net::put_rest(wifi, &mut buff, ESPLinkID::Conn0, remote.0, &ep.as_str(), &msg) {
             Ok(resp) => {
-                let resp: ServerResp = resp;
+                let _resp: ServerResp = resp;
                 //lcd.puts(resp.status);
             },
             Err(_) => check_conn(wifi, ESPLinkID::Conn0, &remote)
@@ -238,7 +239,7 @@ const APP: () = {
         match mt {
             WebSocketReceiveMessageType::Text => lcd.puts(core::str::from_utf8(&buff[..n]).unwrap()),
             WebSocketReceiveMessageType::Ping => lcd.puts("ping!"),
-            _ => asm::bkpt(),
+            _ => panic!("unknown msg type"),
         }
         cx.spawn.test_send2_loop().unwrap();
     }
@@ -259,11 +260,11 @@ const APP: () = {
                     match cx.resources.rx_prod.enqueue(byte) {
                         Ok(_) => {
                         }
-                        Err(_) => asm::bkpt(),
+                        Err(_) => panic!("enqueue error"),
                     }
                 }
                 Err(nb::Error::Other(stm32f1xx_hal::serial::Error::Overrun)) =>
-                    asm::bkpt(),
+                    panic!("usart1 overrun"),
                 _ => break
             }
         }
